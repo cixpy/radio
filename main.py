@@ -62,8 +62,8 @@ def looks_like_ad_text(t: str) -> bool:
     strong = [
         "promo", "promoção", "oferta", "desconto", "imperdível",
         "compre", "aproveite", "garanta", "só hoje", "últimos dias",
-        "parcel", "sem juros", "frete", "cupom", "código",
-        "whatsapp", "zap", "ligue", "telefone", "disque",
+        "parcel", "sem juros", "frete", "cupom", "código", "dinheiro"
+        "whatsapp", "zap", "ligue", "telefone", "disque", "catanduva",
         "site", ".com", ".br", "instagram", "@", "delivery",
         "preço", "reais", "r$", "por apenas", "a partir de",
         # rádio-style
@@ -74,7 +74,8 @@ def looks_like_ad_text(t: str) -> bool:
         "farmácia", "drogaria", "autoescola", "mercado", "supermercado",
         "clínica", "laboratório", "ótica", "loja", "móveis", "colchões",
         "academia", "concessionária", "pizzaria", "lanchonete", "restaurante",
-        "pet shop", "seguro", "consórcio", "financiamento", "imobiliária"
+        "pet shop", "seguro", "consórcio", "financiamento", "imobiliária", "construtora","hospital",
+        "academia", "concessionária", "pizzaria", "lanchonete", "restaurante",
     ]
 
     price_pattern = re.search(r"(r\$)\s*\d+([.,]\d{2})?", t_low)
