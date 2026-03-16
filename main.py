@@ -15,7 +15,7 @@
 STATIONS = {
     "Band_FM":      "https://stm.alphanetdigital.com.br:7040/band",
     "Ondas_Verdes": "https://live3.livemus.com.br:6922/stream",
-    "Jovem_Pan":    "https://sc1s.cdn.upx.com:9986/stream?1772563648730",
+    #"Jovem_Pan":    "https://sc1s.cdn.upx.com:9986/stream?1772563648730",
     # "Radio_exemplo": "https://url-do-stream-aqui",
 }
 
@@ -129,7 +129,7 @@ def heuristic_score(text: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WORKER DE GRAVAÇÃO
+#  WORKER DE GRAVAÇÃO 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def recorder_worker(name: str, url: str, audio_path: str,
