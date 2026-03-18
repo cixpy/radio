@@ -1,148 +1,160 @@
 """
 =============================================================
   DETECTOR DE ANÚNCIOS DE RÁDIO
-  Versão 3.1 — Groq Cloud + múltiplos anúncios por ciclo
+  Versão 5.0 — Correções de falsos positivos
+  Melhorias:
+    - Frases de conversa/nostalgia adicionadas ao NON_AD_PHRASES
+    - Confiança "alta" exige CTA explícito OU preço/telefone
+    - Detecção de locução em 1ª pessoa bloqueia classificação
+    - Prompt LLM reforçado com instrução de contexto conversacional
+    - Rebaixamento automático de confiança sem âncora concreta
 =============================================================
-
-  ╔══════════════════════════════════════════════╗
-  ║   CONFIGURE AS RÁDIOS AQUI (adicione/remova) ║
-  ╚══════════════════════════════════════════════╝
-
-  Formato: "Nome_da_Radio": "URL_do_stream"
-  Para desativar uma rádio sem apagar, comente a linha com #
 """
 
 STATIONS = {
     "Band_FM":      "https://stm.alphanetdigital.com.br:7040/band",
     "Ondas_Verdes": "https://live3.livemus.com.br:6922/stream",
-    #"Jovem_Pan":    "https://sc1s.cdn.upx.com:9986/stream?1772563648730",
-    # "Radio_exemplo": "https://url-do-stream-aqui",
+    #"Jovem_Pan":   "https://sc1s.cdn.upx.com:9986/stream?1772563648730",
 }
 
-# ─── Configurações gerais ────────────────────────────────────────────────────
-
-RECORD_DURATION      = 30       # segundos por captura
-GROQ_WHISPER_MODEL   = "whisper-large-v3-turbo"
-GROQ_LLM_MODEL       = "llama-3.1-8b-instant"
-MIN_SPEECH_RATIO     = 0.40     # fração mínima de fala para processar
-MIN_SPEECH_SEGS      = 3      # mínimo de segmentos de fala
-TRANSCRIPTION_CAP    = 800     # máx de chars enviados ao LLM (aumentado para 30s)
-
-# ─── Imports ─────────────────────────────────────────────────────────────────
+RECORD_DURATION    = 30
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+GROQ_LLM_MODEL     = "llama-3.1-8b-instant"
+MIN_SPEECH_RATIO   = 0.40
+MIN_SPEECH_SEGS    = 3
+TRANSCRIPTION_CAP  = 500   # 30s de fala ≈ 300-350 palavras
 
 import subprocess, datetime, os, re, time, shutil, json, unicodedata
 import threading, queue, traceback
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-
-import librosa
-import torch
-
+import librosa, torch
 from groq import Groq
-
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ─── Carregar variáveis de ambiente ──────────────────────────────────────────
-
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise ValueError("❌ GROQ_API_KEY não encontrada! Verifique o arquivo .env")
+    raise ValueError("❌ GROQ_API_KEY não encontrada!")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
-
-# ─── Timezone ────────────────────────────────────────────────────────────────
 
 try:
     TZ_BR = ZoneInfo("America/Sao_Paulo")
 except Exception:
     TZ_BR = None
 
-
-def br_now():
-    return datetime.datetime.now(TZ_BR) if TZ_BR else datetime.datetime.now()
-
-
-def br_timestamp():
-    return br_now().strftime("%d-%m-%Y_%H-%M-%S")
-
-
-def br_display():
-    return br_now().strftime("%d/%m/%Y %H:%M:%S")
-
-
-# ─── Utilitários ─────────────────────────────────────────────────────────────
+def br_now():       return datetime.datetime.now(TZ_BR) if TZ_BR else datetime.datetime.now()
+def br_timestamp(): return br_now().strftime("%d-%m-%Y_%H-%M-%S")
+def br_display():   return br_now().strftime("%d/%m/%Y %H:%M:%S")
 
 def safe_filename(text: str, max_len: int = 60) -> str:
-    if not text:
-        return "Desconhecido"
-    text = str(text).strip()
-    text = unicodedata.normalize("NFKD", text)
+    if not text: return "Desconhecido"
+    text = unicodedata.normalize("NFKD", str(text).strip())
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     text = re.sub(r"[^\w\- ]+", "_", text, flags=re.UNICODE)
     text = re.sub(r"\s+", "_", text).strip("_")
     return (text or "Desconhecido")[:max_len]
 
 
-# ─── Heurística ──────────────────────────────────────────────────────────────
+# ─── Heurística reforçada ─────────────────────────────────────────────────────
 
 STRONG_AD_KEYWORDS = [
-    "promoção", "oferta", "desconto", "imperdível", "compre", "aproveite",
-    "garanta", "só hoje", "últimos dias", "parcel", "sem juros", "frete",
-    "cupom", "código", "whatsapp", "zap", "ligue", "telefone", "disque",
-    "site", ".com", ".br", "instagram", "@", "delivery", "preço", "reais",
-    "r$", "por apenas", "a partir de", "vem pra", "venha", "visite",
-    "confira", "peça já", "acesse", "baixe", "clique",
+    "promoção", "oferta", "desconto", "imperdível", "compre", "aproveite", "garanta",
+    "só hoje", "últimos dias", "parcel", "sem juros", "frete", "cupom", "código",
+    "whatsapp", "zap", "ligue", "telefone", "disque", "site", ".com", ".br",
+    "instagram", "@", "delivery", "preço", "reais", "r$", "por apenas", "a partir de",
+    "vem pra", "venha", "visite", "confira", "peça já", "acesse", "baixe", "clique",
 ]
 
 BUSINESS_WORDS = [
-    "farmácia", "drogaria", "autoescola", "mercado", "supermercado",
-    "clínica", "laboratório", "ótica", "loja", "móveis", "colchões",
-    "academia", "concessionária", "pizzaria", "lanchonete", "restaurante",
-    "pet shop", "seguro", "consórcio", "financiamento", "imobiliária",
-    "construtora", "hospital", "quilo", "posto", "oficina", "hotel",
-    "pousada", "colégio", "faculdade", "curso", "clique", "aplicativo",
+    "farmácia", "drogaria", "autoescola", "mercado", "supermercado", "clínica",
+    "laboratório", "ótica", "loja", "móveis", "colchões", "academia", "concessionária",
+    "pizzaria", "lanchonete", "restaurante", "pet shop", "seguro", "consórcio",
+    "financiamento", "imobiliária", "construtora", "hospital", "quilo", "posto",
+    "oficina", "hotel", "pousada", "colégio", "faculdade", "curso", "aplicativo",
 ]
 
 NON_AD_PHRASES = [
+    # Jornalismo / notícias
     "segundo informações", "de acordo com", "o governador", "o prefeito",
     "a prefeitura", "a polícia", "os bombeiros", "o governo", "a câmara",
     "o congresso", "o presidente", "a secretaria", "a temperatura",
+    # Locução / transição
     "boa tarde", "bom dia", "boa noite", "você está ouvindo",
     "próxima música", "agora vamos", "fique ligado",
+    # ── NOVO: Conversa/opinião em 1ª pessoa e nostalgia ──
+    "eu sinto falta", "eu lembro", "lembro quando", "lembro que",
+    "antigamente", "de antigamente", "era melhor", "era diferente",
+    "quando eu era", "quando a gente", "na minha época",
+    "cara,", "né, cara", "sabe como é", "você lembra",
+    "que saudade", "minha avó", "meu pai", "minha mãe",
+    "a gente fazia", "a gente comia", "a gente ia",
+    "hoje em dia", "mudou muito", "não é mais assim",
 ]
+
+# CTAs explícitos que ancoram confiança "alta"
+EXPLICIT_CTA = [
+    "ligue", "acesse", "compre", "whatsapp", "zap", "visite",
+    "peça já", "clique", "baixe", "chame no", "manda mensagem",
+    "fale com", "entre em contato", "vá ao site", "pelo site",
+    "no instagram", "no face", "no aplicativo",
+]
+
+# Padrões de locução em 1ª pessoa (conversa de locutor/entrevistado)
+FIRST_PERSON_PATTERNS = re.compile(
+    r"\b(eu |a gente |nós |minha |meu |nossa |nosso )"
+    r"(sinto|lembro|acho|gosto|quero|fazia|comia|ia|era|fui|vim|tenho|tinha)\b",
+    re.IGNORECASE,
+)
 
 
 def heuristic_score(text: str) -> dict:
     if not text:
-        return {"ad_score": 0, "nonad_score": 0, "has_price": False, "has_phone": False}
-    t      = text.lower()
+        return {
+            "ad_score": 0, "nonad_score": 0,
+            "has_price": False, "has_phone": False,
+            "has_cta": False, "is_first_person_chat": False,
+        }
+    t = text.lower()
+
     price  = bool(re.search(r"r\$\s*\d+([.,]\d{2})?|\d+\s*reais", t))
     phone  = bool(re.search(r"(\(?\d{2}\)?\s*)?\d{4,5}[-\s]?\d{4}", t))
+    has_cta = any(k in t for k in EXPLICIT_CTA)
+
     strong = sum(1 for k in STRONG_AD_KEYWORDS if k in t)
-    biz    = sum(1 for k in BUSINESS_WORDS if k in t)
-    nonad  = sum(1 for k in NON_AD_PHRASES  if k in t)
-    ad_score = strong * 2 + biz + (3 if price else 0) + (2 if phone else 0)
-    return {"ad_score": ad_score, "nonad_score": nonad, "has_price": price, "has_phone": phone}
+    biz    = sum(1 for k in BUSINESS_WORDS    if k in t)
+    nonad  = sum(1 for k in NON_AD_PHRASES    if k in t)
+
+    # Detecta conversa casual em 1ª pessoa
+    is_first_person_chat = bool(FIRST_PERSON_PATTERNS.search(text))
+    if is_first_person_chat:
+        nonad += 3  # peso extra para bloquear LLM
+
+    ad_score = strong * 2 + biz + (3 if price else 0) + (2 if phone else 0) + (2 if has_cta else 0)
+
+    return {
+        "ad_score": ad_score,
+        "nonad_score": nonad,
+        "has_price": price,
+        "has_phone": phone,
+        "has_cta": has_cta,
+        "is_first_person_chat": is_first_person_chat,
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  WORKER DE GRAVAÇÃO 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Worker de gravação ───────────────────────────────────────────────────────
 
-def recorder_worker(name: str, url: str, audio_path: str,
-                    work_queue: queue.Queue, stop_event: threading.Event):
+def recorder_worker(name, url, audio_path, work_queue, stop_event):
     print(f"  🎙️  Gravador iniciado: {name}")
     while not stop_event.is_set():
         ts        = br_timestamp()
         file_path = os.path.join(audio_path, f"{safe_filename(name)}_{ts}.mp3")
         cmd = [
-            "ffmpeg", "-i", url,
-            "-t", str(RECORD_DURATION),
-            "-acodec", "libmp3lame",
-            "-ar", "16000", "-ac", "1",
+            "ffmpeg", "-i", url, "-t", str(RECORD_DURATION),
+            "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1",
             file_path, "-y", "-loglevel", "quiet",
         ]
         try:
@@ -154,13 +166,10 @@ def recorder_worker(name: str, url: str, audio_path: str,
             if os.path.exists(file_path):
                 os.remove(file_path)
         time.sleep(2)
-
     print(f"  🛑 Gravador encerrado: {name}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CLASSE PRINCIPAL
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Classe principal ─────────────────────────────────────────────────────────
 
 class AdDetector:
     def __init__(self):
@@ -175,217 +184,194 @@ class AdDetector:
 
         print("🔧 Carregando Silero VAD...")
         self.vad_model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
+            repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True,
         )
         self.get_speech_timestamps = utils[0]
-
-        print("☁️  Groq configurado:")
-        print(f"     Transcrição : {GROQ_WHISPER_MODEL}")
-        print(f"     LLM         : {GROQ_LLM_MODEL}")
-        print(f"     Ciclo       : {RECORD_DURATION}s")
-
+        print(f"☁️  Groq | Whisper: {GROQ_WHISPER_MODEL} | LLM: {GROQ_LLM_MODEL} | Ciclo: {RECORD_DURATION}s")
         self._init_excel()
         print("✅ Pronto.\n")
 
-    # ── Excel ────────────────────────────────────────────────────────────────
+    # ── Excel ─────────────────────────────────────────────────────────────────
 
     def _init_excel(self):
         if os.path.exists(self.report_path):
             print(f"📊 Relatório existente: {self.report_path}")
             return
-
         wb = Workbook()
         ws = wb.active
         ws.title = "Anúncios Detectados"
-
         headers = [
             "Data/Hora", "Rádio", "Anunciante", "Produto/Serviço",
             "Confiança", "Transcrição (resumo)", "Arquivo de Áudio",
         ]
-
-        header_fill = PatternFill("solid", start_color="1F4E79")
-        header_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-        thin_side   = Side(style="thin", color="CCCCCC")
-        border      = Border(left=thin_side, right=thin_side, bottom=thin_side)
-
-        for col, h in enumerate(headers, start=1):
-            cell = ws.cell(row=1, column=col, value=h)
-            cell.font      = header_font
-            cell.fill      = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border    = border
-
+        hfill  = PatternFill("solid", start_color="1F4E79")
+        hfont  = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+        border = Border(**{s: Side(style="thin", color="CCCCCC") for s in ("left", "right", "bottom")})
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.font = hfont; c.fill = hfill
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border
         ws.row_dimensions[1].height = 30
         ws.freeze_panes = "A2"
-
-        for i, w in enumerate([20, 15, 22, 22, 12, 60, 40], start=1):
+        for i, w in enumerate([20, 15, 22, 22, 12, 60, 40], 1):
             ws.column_dimensions[get_column_letter(i)].width = w
-
         ws2 = wb.create_sheet("Resumo por Rádio")
-        for col, h in enumerate(["Rádio", "Total de Anúncios", "Última Detecção"], start=1):
-            cell = ws2.cell(row=1, column=col, value=h)
-            cell.font = Font(bold=True, color="FFFFFF", name="Arial")
-            cell.fill = PatternFill("solid", start_color="2E75B6")
-
+        for col, h in enumerate(["Rádio", "Total de Anúncios", "Última Detecção"], 1):
+            c = ws2.cell(row=1, column=col, value=h)
+            c.font = Font(bold=True, color="FFFFFF", name="Arial")
+            c.fill = PatternFill("solid", start_color="2E75B6")
         wb.save(self.report_path)
         print(f"📊 Relatório criado: {self.report_path}")
 
-    def _append_to_excel(self, station: str, info: dict, snippet: str, audio_file: str):
+    def _append_to_excel(self, station, info, snippet, audio_file):
         try:
-            wb = load_workbook(self.report_path)
-            ws = wb["Anúncios Detectados"]
-            next_row = ws.max_row + 1
-
-            conf       = info.get("confianca", "baixa")
-            fill_color = {"alta": "E2EFDA", "media": "FFF2CC", "baixa": "FCE4D6"}.get(conf, "FFFFFF")
-            row_fill   = PatternFill("solid", start_color=fill_color)
-            row_font   = Font(name="Arial", size=10)
-            thin_side  = Side(style="thin", color="DDDDDD")
-            row_border = Border(left=thin_side, right=thin_side, bottom=thin_side)
-
-            valores = [
-                br_display(),
-                station,
-                info.get("anunciante") or "—",
-                info.get("produto")    or "—",
-                conf.upper(),
-                (snippet or "")[:200],
-                os.path.basename(audio_file),
-            ]
-
-            for col, val in enumerate(valores, start=1):
-                cell = ws.cell(row=next_row, column=col, value=val)
-                cell.font      = row_font
-                cell.fill      = row_fill
-                cell.border    = row_border
-                cell.alignment = Alignment(vertical="center", wrap_text=(col == 6))
-            ws.row_dimensions[next_row].height = 18
-
+            wb  = load_workbook(self.report_path)
+            ws  = wb["Anúncios Detectados"]
+            row = ws.max_row + 1
+            conf = info.get("confianca", "baixa")
+            fill = PatternFill("solid", start_color={
+                "alta": "E2EFDA", "media": "FFF2CC", "baixa": "FCE4D6",
+            }.get(conf, "FFFFFF"))
+            font = Font(name="Arial", size=10)
+            bord = Border(**{s: Side(style="thin", color="DDDDDD") for s in ("left", "right", "bottom")})
+            for col, val in enumerate([
+                br_display(), station,
+                info.get("anunciante") or "—", info.get("produto") or "—",
+                conf.upper(), (snippet or "")[:200], os.path.basename(audio_file),
+            ], 1):
+                c = ws.cell(row=row, column=col, value=val)
+                c.font = font; c.fill = fill; c.border = bord
+                c.alignment = Alignment(vertical="center", wrap_text=(col == 6))
+            ws.row_dimensions[row].height = 18
             ws2 = wb["Resumo por Rádio"]
-            station_row = None
-            for row in ws2.iter_rows(min_row=2):
-                if row[0].value == station:
-                    station_row = row
-                    break
-
-            if station_row:
-                station_row[1].value = (station_row[1].value or 0) + 1
-                station_row[2].value = br_display()
+            sr  = next((r for r in ws2.iter_rows(min_row=2) if r[0].value == station), None)
+            if sr:
+                sr[1].value = (sr[1].value or 0) + 1
+                sr[2].value = br_display()
             else:
                 nr = ws2.max_row + 1
                 ws2.cell(row=nr, column=1, value=station)
                 ws2.cell(row=nr, column=2, value=1)
                 ws2.cell(row=nr, column=3, value=br_display())
-
             wb.save(self.report_path)
-            print(f"  ✅ Excel salvo ({next_row - 1} anúncios no total)")
-
+            print(f"  ✅ Excel salvo ({row - 1} anúncios)")
         except Exception as e:
-            print(f"  ⚠️  Erro ao salvar Excel: {e}")
-            traceback.print_exc()
+            print(f"  ⚠️  Erro ao salvar Excel: {e}"); traceback.print_exc()
 
-    # ── VAD ──────────────────────────────────────────────────────────────────
+    # ── VAD ───────────────────────────────────────────────────────────────────
 
-    def analyze_vad(self, file_path: str):
+    def analyze_vad(self, file_path):
         try:
             y, sr = librosa.load(file_path, sr=16000)
-            wav   = torch.from_numpy(y).float()
-            segs  = self.get_speech_timestamps(wav, self.vad_model, sampling_rate=16000)
-
-            if not segs:
-                return None
-
+            segs  = self.get_speech_timestamps(
+                torch.from_numpy(y).float(), self.vad_model, sampling_rate=16000,
+            )
+            if not segs: return None
             duration     = len(y) / sr
             total_speech = sum((s["end"] - s["start"]) / sr for s in segs)
             ratio        = total_speech / duration
-
             if ratio < MIN_SPEECH_RATIO or len(segs) < MIN_SPEECH_SEGS:
                 return None
-
             return {"speech_ratio": ratio, "fragments": len(segs)}
         except Exception as e:
-            print(f"  ⚠️  Erro VAD: {e}")
-            return None
+            print(f"  ⚠️  Erro VAD: {e}"); return None
 
-    # ── Transcrição via Groq Whisper ──────────────────────────────────────────
+    # ── Transcrição ───────────────────────────────────────────────────────────
 
-    def transcribe(self, file_path: str) -> str:
+    def transcribe(self, file_path):
         try:
             with open(file_path, "rb") as f:
-                response = groq_client.audio.transcriptions.create(
+                r = groq_client.audio.transcriptions.create(
                     file=(os.path.basename(file_path), f),
-                    model=GROQ_WHISPER_MODEL,
-                    language="pt",
-                    response_format="text",
+                    model=GROQ_WHISPER_MODEL, language="pt", response_format="text",
                 )
-            return (response if isinstance(response, str) else str(response)).strip()
+            return (r if isinstance(r, str) else str(r)).strip()
         except Exception as e:
-            print(f"  ⚠️  Erro Groq Whisper: {e}")
-            traceback.print_exc()
-            return ""
+            print(f"  ⚠️  Erro Whisper: {e}"); traceback.print_exc(); return ""
 
-    # ── Classificação múltipla via Groq LLM ──────────────────────────────────
+    # ── Validação de confiança ────────────────────────────────────────────────
 
-    def _groq_classify_multi(self, transcription: str, heur: dict) -> list:
-        dica = ""
-        if heur["ad_score"] >= 4:
-            dica = "ATENÇÃO: análise automática sugere fortemente que há anúncios."
-        elif heur["ad_score"] >= 2:
-            dica = "Análise automática detectou alguns indicadores de anúncio."
-        elif heur["nonad_score"] >= 2:
-            dica = "Análise automática sugere conteúdo predominantemente jornalístico/informativo."
+    def _validate_confidence(self, conf: str, heur: dict) -> str:
+        """
+        Rebaixa confiança "alta" para "media" quando não há âncora concreta:
+        preço, telefone ou CTA explícito.
+        Sem nenhuma âncora, "media" vira "baixa".
+        """
+        has_anchor = heur["has_price"] or heur["has_phone"] or heur["has_cta"]
 
-        prompt = f"""Você é um classificador especializado em áudio de rádio brasileiro.
-O texto abaixo é a transcrição de {RECORD_DURATION} segundos de rádio e pode conter ZERO, UM ou MAIS anúncios publicitários diferentes, intercalados com músicas, notícias ou locuções normais.
+        if conf == "alta" and not has_anchor:
+            print("  ⬇️  Confiança rebaixada: alta → media (sem preço/telefone/CTA)")
+            return "media"
 
-Sua tarefa:
-1. Identifique CADA anúncio publicitário distinto presente no texto.
-2. Anúncios diferentes têm anunciantes/marcas diferentes — não agrupe dois anunciantes em um só.
-3. Se não houver nenhum anúncio, retorne lista vazia.
+        if conf == "media" and not has_anchor and heur["ad_score"] < 4:
+            print("  ⬇️  Confiança rebaixada: media → baixa (sem âncora + score baixo)")
+            return "baixa"
 
-Critérios para ANÚNCIO:
-- Promoções, preços, descontos, parcelamentos
-- Nome de empresa/marca vendendo produto ou serviço
-- Call-to-action: compre, visite, ligue, acesse, aproveite
-- Endereço, telefone, site, Instagram, WhatsApp de negócio
+        return conf
 
-Critérios para NÃO-ANÚNCIO (ignore esses trechos):
-- Locução informativa (notícias, boletins, previsão do tempo)
-- Apresentação de músicas ou programas
-- Conversa entre locutores sem venda
-- Letras de música
+    # ── Classificação compacta ────────────────────────────────────────────────
 
-{dica}
+    def classify_multi(self, transcription: str) -> list:
+        """
+        Retorna lista de anúncios aprovados.
+        Chama o LLM apenas quando necessário.
+        """
+        text = (transcription or "").strip()
+        if len(text) < 25:
+            return []
 
-Texto transcrito:
-\"\"\"{transcription}\"\"\"
+        heur = heuristic_score(text)
 
-Responda SOMENTE com JSON válido no formato:
-{{
-  "anuncios": [
-    {{
-      "anunciante": "nome da marca/empresa",
-      "produto": "produto ou serviço anunciado",
-      "confianca": "alta" ou "media" ou "baixa",
-      "motivo_curto": "justificativa em 1 frase",
-      "trecho": "trecho resumido do texto que originou essa detecção (máx 100 chars)"
-    }}
-  ]
-}}
+        # ── Bloqueio 1: claramente não é anúncio
+        if heur["ad_score"] < 2 and heur["nonad_score"] >= 2:
+            return []
 
-Se não houver anúncios: {{"anuncios": []}}""".strip()
+        # ── Bloqueio 2: conversa em 1ª pessoa sem qualquer âncora de anúncio
+        if heur["is_first_person_chat"] and not heur["has_price"] and not heur["has_cta"]:
+            print("  🗣️  Ignorado: locução em 1ª pessoa sem âncora de anúncio.")
+            return []
+
+        # ── Shortcut: score muito alto + preço → registra sem chamar LLM
+        if heur["ad_score"] >= 8 and heur["has_price"]:
+            return [{
+                "eh_anuncio": True, "anunciante": None, "produto": None,
+                "confianca": "media",
+                "motivo_curto": "Score heurístico alto (sem LLM)",
+                "trecho": "",
+            }]
+
+        # ── Prompt reforçado com instrução de contexto conversacional
+        dica = (
+            "ATENÇÃO: alta probabilidade de anúncio." if heur["ad_score"] >= 4
+            else "Pode haver anúncio." if heur["ad_score"] >= 2
+            else ""
+        )
+        prompt = (
+            f"Classifique os anúncios publicitários nesta transcrição de rádio brasileiro ({RECORD_DURATION}s).\n"
+            f"Pode haver zero, um ou mais anúncios distintos.\n\n"
+            f"REGRAS OBRIGATÓRIAS:\n"
+            f"- Anúncio = marca/empresa real + venda/promoção/CTA (ex: ligue, acesse, compre, whatsapp).\n"
+            f"- Ignore: notícias, locução, letras de música, entrevistas, conversa casual.\n"
+            f"- Conversa em 1ª pessoa ('eu sinto', 'eu lembro', 'a gente fazia', 'antigamente') "
+            f"indica opinião/nostalgia do locutor — NÃO é anúncio, mesmo que mencione produtos.\n"
+            f"- Sem CTA explícito E sem preço/telefone → confiança máxima = 'media'.\n"
+            f"- Só use 'alta' se houver CTA explícito (ligue, acesse, compre etc.) OU preço/telefone.\n"
+            f"{dica}\n\n"
+            f"Texto:\n\"\"\"{text}\"\"\"\n\n"
+            f"Responda APENAS JSON:\n"
+            f'{{"anuncios":[{{"anunciante":"...","produto":"...","confianca":"alta|media|baixa","trecho":"...max80chars"}}]}}\n'
+            f"Se não houver: {{\"anuncios\":[]}}"
+        )
 
         try:
-            response = groq_client.chat.completions.create(
+            resp = groq_client.chat.completions.create(
                 model=GROQ_LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=800,
+                temperature=0, max_tokens=600,
                 response_format={"type": "json_object"},
             )
-            raw = response.choices[0].message.content or ""
+            raw  = resp.choices[0].message.content or ""
             data = {}
             try:
                 data = json.loads(raw)
@@ -397,149 +383,134 @@ Se não houver anúncios: {{"anuncios": []}}""".strip()
             if not isinstance(anuncios, list):
                 return []
 
-            resultado = []
-            seen_anunciantes = set()
+            aprovados = []
+            seen      = set()
 
             for ad in anuncios:
-                if not isinstance(ad, dict):
-                    continue
+                if not isinstance(ad, dict): continue
 
-                anunciante = ad.get("anunciante") or ""
-                if isinstance(anunciante, str) and anunciante.strip().lower() in ("", "null", "none"):
+                anunciante = (ad.get("anunciante") or "").strip() or None
+                if anunciante and anunciante.lower() in ("null", "none"):
                     anunciante = None
 
-                produto = ad.get("produto") or ""
-                if isinstance(produto, str) and produto.strip().lower() in ("", "null", "none"):
+                produto = (ad.get("produto") or "").strip() or None
+                if produto and produto.lower() in ("null", "none"):
                     produto = None
 
                 conf = str(ad.get("confianca", "baixa")).lower().strip()
                 if conf not in ("alta", "media", "baixa"):
                     conf = "baixa"
 
-                # Deduplicar pelo nome do anunciante (case-insensitive)
-                chave = (anunciante or "").strip().lower()
-                if chave and chave in seen_anunciantes:
-                    continue
-                if chave:
-                    seen_anunciantes.add(chave)
+                # ── Valida e potencialmente rebaixa confiança
+                conf = self._validate_confidence(conf, heur)
 
-                resultado.append({
-                    "eh_anuncio":   True,
-                    "anunciante":   anunciante,
-                    "produto":      produto,
-                    "confianca":    conf,
+                # Deduplicar por anunciante
+                chave = (anunciante or "").lower()
+                if chave and chave in seen: continue
+                if chave: seen.add(chave)
+
+                item = {
+                    "eh_anuncio": True,
+                    "anunciante": anunciante,
+                    "produto": produto,
+                    "confianca": conf,
                     "motivo_curto": ad.get("motivo_curto", ""),
-                    "trecho":       ad.get("trecho", ""),
+                    "trecho": ad.get("trecho", ""),
+                }
+
+                # Aprovação por confiança
+                if conf == "alta":
+                    aprovados.append(item)
+                elif conf == "media" and heur["ad_score"] >= 2:
+                    aprovados.append(item)
+                elif conf == "baixa" and heur["ad_score"] >= 5 and anunciante:
+                    item["confianca"] = "media"
+                    aprovados.append(item)
+
+            # Fallback heurístico final
+            if not aprovados and heur["ad_score"] >= 6 and heur["has_price"]:
+                aprovados.append({
+                    "eh_anuncio": True, "anunciante": None, "produto": None,
+                    "confianca": "baixa",
+                    "motivo_curto": "Detectado por heurística (preço + keywords)",
+                    "trecho": "",
                 })
 
-            return resultado
+            return aprovados
 
         except Exception as e:
-            print(f"  ⚠️  Erro Groq LLM: {e}")
-            return []
+            print(f"  ⚠️  Erro LLM: {e}"); return []
 
-    def classify_multi(self, transcription: str) -> list:
-        transcription = (transcription or "").strip()
-        if len(transcription) < 25:
-            return []
+    # ── Salvar áudio ──────────────────────────────────────────────────────────
 
-        heur     = heuristic_score(transcription)
-        anuncios = self._groq_classify_multi(transcription, heur)
-
-        aprovados = []
-        for ad in anuncios:
-            conf       = ad.get("confianca", "baixa")
-            anunciante = ad.get("anunciante")
-
-            if conf == "alta":
-                aprovados.append(ad)
-            elif conf == "media" and heur["ad_score"] >= 2:
-                aprovados.append(ad)
-            elif conf == "baixa" and heur["ad_score"] >= 5 and anunciante:
-                ad["confianca"] = "media"
-                aprovados.append(ad)
-
-        # Fallback heurístico se o LLM não detectou nada mas score é muito alto
-        if not aprovados and heur["ad_score"] >= 6 and heur["has_price"]:
-            aprovados.append({
-                "eh_anuncio":   True,
-                "anunciante":   None,
-                "produto":      None,
-                "confianca":    "baixa",
-                "motivo_curto": "Detectado por heurística (preço + palavras-chave)",
-                "trecho":       "",
-            })
-
-        return aprovados
-
-    # ── Salvar áudio ─────────────────────────────────────────────────────────
-
-    def save_ad(self, station: str, audio_file: str, info: dict, index: int = 0) -> str:
+    def save_ad(self, station, audio_file, info, index=0):
         marca   = safe_filename(info.get("anunciante") or "Desconhecido")
         produto = safe_filename(info.get("produto")    or "")
-        ts      = br_timestamp()
         parts   = [safe_filename(station), marca]
-        if produto and produto != "Desconhecido":
-            parts.append(produto)
-        parts.append(ts)
-        if index > 0:
-            parts.append(f"ad{index}")
+        if produto and produto != "Desconhecido": parts.append(produto)
+        parts.append(br_timestamp())
+        if index > 0: parts.append(f"ad{index}")
         dest = os.path.join(self.ads_path, "__".join(parts) + ".mp3")
         shutil.copy2(audio_file, dest)
         return dest
 
-    # ── Processar item da fila ────────────────────────────────────────────────
+    # ── Processar item ────────────────────────────────────────────────────────
 
-    def process_item(self, name: str, audio_file: str):
+    def process_item(self, name, audio_file):
         try:
             vad = self.analyze_vad(audio_file)
             if not vad:
-                print(f"  🎵 [{name}] Ignorado (pouca fala)")
-                return
+                print(f"  🎵 [{name}] Ignorado (pouca fala)"); return
 
-            print(f"  🔍 [{name}] Transcrevendo via Groq... (speech={vad['speech_ratio']:.0%}, frags={vad['fragments']})")
+            print(
+                f"  🔍 [{name}] Transcrevendo... "
+                f"(speech={vad['speech_ratio']:.0%}, frags={vad['fragments']})"
+            )
             text    = self.transcribe(audio_file)
             snippet = text[:TRANSCRIPTION_CAP]
 
             if not snippet:
-                print(f"  ⚠️  [{name}] Transcrição vazia, ignorando.")
+                print(f"  ⚠️  [{name}] Transcrição vazia."); return
+
+            # Filtro heurístico pré-LLM
+            heur = heuristic_score(snippet)
+
+            if heur["ad_score"] < 2 and heur["nonad_score"] >= 2:
+                print(f"  🎵 [{name}] Descartado por heurística (jornalístico/locutor).")
+                return
+
+            # Bloqueio de conversa casual sem âncora
+            if heur["is_first_person_chat"] and not heur["has_price"] and not heur["has_cta"]:
+                print(f"  🗣️  [{name}] Descartado: conversa em 1ª pessoa sem preço/CTA.")
                 return
 
             print(f"  📝 [{name}] {snippet[:200].replace(chr(10), ' ')!r}")
-
             anuncios = self.classify_multi(snippet)
 
             if not anuncios:
-                print(f"  🎵 [{name}] Nenhum anúncio detectado.")
-                return
+                print(f"  🎵 [{name}] Nenhum anúncio detectado."); return
 
-            print(f"  📢 [{name}] {len(anuncios)} anúncio(s) detectado(s) neste ciclo!")
-
-            for i, info in enumerate(anuncios, start=1):
-                marca  = info.get("anunciante") or "Desconhecido"
-                conf   = info.get("confianca", "media")
-                trecho = info.get("trecho", "")
-                print(f"       [{i}] {marca} (conf={conf}) — {trecho[:80]}")
-
+            print(f"  📢 [{name}] {len(anuncios)} anúncio(s)!")
+            for i, info in enumerate(anuncios, 1):
+                marca = info.get("anunciante") or "Desconhecido"
+                conf  = info.get("confianca", "media")
+                print(f"       [{i}] {marca} (conf={conf}) — {info.get('trecho', '')[:80]}")
                 idx   = i if len(anuncios) > 1 else 0
                 saved = self.save_ad(name, audio_file, info, index=idx)
                 self._append_to_excel(name, info, snippet, saved)
-                print(f"       💾 Áudio: {os.path.basename(saved)}")
+                print(f"       💾 {os.path.basename(saved)}")
 
         except Exception as e:
-            print(f"  ❌ [{name}] Erro: {e}")
-            traceback.print_exc()
+            print(f"  ❌ [{name}] Erro: {e}"); traceback.print_exc()
         finally:
-            if os.path.exists(audio_file):
-                os.remove(audio_file)
+            if os.path.exists(audio_file): os.remove(audio_file)
 
     # ── Loop principal ────────────────────────────────────────────────────────
 
     def run(self):
-        print("🚀 Iniciando monitoramento contínuo...")
+        print("🚀 Monitoramento iniciado...")
         print(f"   Rádios   : {', '.join(STATIONS.keys())}")
-        print(f"   Duração  : {RECORD_DURATION}s por ciclo")
-        print(f"   Relatório: {os.path.abspath(self.report_path)}")
+        print(f"   Duração  : {RECORD_DURATION}s | Relatório: {os.path.abspath(self.report_path)}")
         print("   (Ctrl+C para parar)\n")
 
         work_queue = queue.Queue()
@@ -550,35 +521,26 @@ Se não houver anúncios: {{"anuncios": []}}""".strip()
             t = threading.Thread(
                 target=recorder_worker,
                 args=(name, url, self.audio_path, work_queue, stop_event),
-                daemon=True,
-                name=f"rec-{name}",
+                daemon=True, name=f"rec-{name}",
             )
-            t.start()
-            threads.append(t)
+            t.start(); threads.append(t)
 
         print(f"  🎙️  {len(threads)} gravadores iniciados.\n")
-
         try:
             while True:
                 try:
                     name, audio_file = work_queue.get(timeout=2)
-                    print(f"\n{'─'*60}")
-                    print(f"📥 [{name}] Novo áudio — {br_display()}")
+                    print(f"\n{'─'*60}\n📥 [{name}] Novo áudio — {br_display()}")
                     self.process_item(name, audio_file)
                     work_queue.task_done()
                 except queue.Empty:
                     continue
-
         except KeyboardInterrupt:
             print("\n\n🛑 Encerrando...")
             stop_event.set()
-            for t in threads:
-                t.join(timeout=5)
+            for t in threads: t.join(timeout=5)
             print("👋 Encerrado.")
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    detector = AdDetector()
-    detector.run()
+    AdDetector().run()
