@@ -1,20 +1,3 @@
-"""
-=============================================================
-  DETECTOR DE ANÚNCIOS DE RÁDIO  v7.2
-  Correções v7.1:
-  - name_in_text: tokens ≥ 3 chars, match 60%
-  - Auto-promoção da rádio filtrada
-  - Prompt LLM com distinção clara anunciante vs produto
-  - Cooldown de 90s por anunciante (anti-duplicata)
-  - should_skip recebe station_name e text
-  Correções v7.2:
-  - RETAIL_KEYWORDS + is_retail_anchor(): marcas dentro de anúncio
-    de supermercado/loja viram produtos do varejista, não anunciantes
-  - Prompt LLM com regra explícita do varejista âncora + exemplo
-  - Filtro sem anunciante endurecido: exige nome confirmado para
-    confiança baixa E média (antes só baixa)
-=============================================================
-"""
 
 STATIONS = {
     "Band_FM":      "https://stm.alphanetdigital.com.br:7040/band",
